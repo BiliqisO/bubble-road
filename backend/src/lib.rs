@@ -198,3 +198,180 @@ pub fn query(deps: Deps, _env: Env, msg: QueryMsg) -> StdResult<Binary> {
         }
     }
 }
+
+// Test module
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmwasm_std::testing::{
+        mock_dependencies, mock_env, mock_info, MockApi, MockQuerier, MockStorage,
+    };
+    use cosmwasm_std::{coins, from_binary, OwnedDeps};
+
+    fn setup_contract() -> OwnedDeps<MockStorage, MockApi, MockQuerier> {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            price: Uint128::new(1000),
+            description: "Test Item".to_string(),
+        };
+        let info = mock_info("seller", &[]);
+        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(res.attributes[0].value, "instantiate");
+        deps
+    }
+
+    #[test]
+    fn test_instantiate() {
+        let mut deps = mock_dependencies();
+        let msg = InstantiateMsg {
+            price: Uint128::new(1000),
+            description: "Test Item".to_string(),
+        };
+        let info = mock_info("seller", &[]);
+        let res = instantiate(deps.as_mut(), mock_env(), info, msg).unwrap();
+        assert_eq!(0, res.messages.len());
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetItem {}).unwrap();
+        let item: ItemResponse = from_binary(&res).unwrap();
+        assert_eq!(item.seller, "seller");
+        assert_eq!(item.price, Uint128::new(1000));
+        assert_eq!(item.description, "Test Item");
+        assert_eq!(item.sold, false);
+        assert_eq!(item.buyer, None);
+        assert_eq!(item.delivered, false);
+    }
+
+    #[test]
+    fn test_buy_item_success() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(1000, "uxion"));
+        let msg = ExecuteMsg::BuyItem {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        assert_eq!(res.attributes[0].value, "buy_item");
+        assert_eq!(res.attributes[1].value, "buyer");
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetItem {}).unwrap();
+        let item: ItemResponse = from_binary(&res).unwrap();
+        assert_eq!(item.sold, true);
+        assert_eq!(item.buyer, Some("buyer".to_string()));
+        assert_eq!(item.delivered, false);
+    }
+
+    #[test]
+    fn test_buy_item_insufficient_funds() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(500, "uxion"));
+        let msg = ExecuteMsg::BuyItem {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg.clone());
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Generic error: Insufficient funds"
+        );
+    }
+
+    #[test]
+    fn test_buy_item_already_sold() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer1", &coins(1000, "uxion"));
+        let msg = ExecuteMsg::BuyItem {};
+        execute(deps.as_mut(), mock_env(), info, msg.clone()).unwrap();
+
+        let info = mock_info("buyer2", &coins(1000, "uxion"));
+        let res = execute(deps.as_mut(), mock_env(), info, msg);
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Generic error: Item already sold"
+        );
+    }
+
+    #[test]
+    fn test_confirm_delivery_success() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(1000, "uxion"));
+        execute(deps.as_mut(), mock_env(), info, ExecuteMsg::BuyItem {}).unwrap();
+
+        let info = mock_info("seller", &[]);
+        let msg = ExecuteMsg::ConfirmDelivery {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        assert_eq!(res.attributes[0].value, "confirm_delivery");
+        assert_eq!(res.messages.len(), 1);
+        if let CosmosMsg::Bank(BankMsg::Send { to_address, amount }) = &res.messages[0].msg {
+            assert_eq!(to_address, "seller");
+            assert_eq!(amount[0].amount, Uint128::new(1000));
+            assert_eq!(amount[0].denom, "uxion");
+        }
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetItem {}).unwrap();
+        let item: ItemResponse = from_binary(&res).unwrap();
+        assert_eq!(item.delivered, true);
+    }
+
+    #[test]
+    fn test_confirm_delivery_not_seller() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(1000, "uxion"));
+        execute(deps.as_mut(), mock_env(), info, ExecuteMsg::BuyItem {}).unwrap();
+
+        let info = mock_info("not_seller", &[]);
+        let msg = ExecuteMsg::ConfirmDelivery {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg);
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Generic error: Only seller can confirm delivery"
+        );
+    }
+
+    #[test]
+    fn test_refund_buyer_success() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(1000, "uxion"));
+        execute(deps.as_mut(), mock_env(), info, ExecuteMsg::BuyItem {}).unwrap();
+
+        let info = mock_info("seller", &[]);
+        let msg = ExecuteMsg::RefundBuyer {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg).unwrap();
+
+        assert_eq!(res.attributes[0].value, "refund_buyer");
+        assert_eq!(res.attributes[1].value, "buyer");
+        assert_eq!(res.messages.len(), 1);
+        if let CosmosMsg::Bank(BankMsg::Send { to_address, amount }) = &res.messages[0].msg {
+            assert_eq!(to_address, "buyer");
+            assert_eq!(amount[0].amount, Uint128::new(1000));
+            assert_eq!(amount[0].denom, "uxion");
+        }
+
+        let res = query(deps.as_ref(), mock_env(), QueryMsg::GetItem {}).unwrap();
+        let item: ItemResponse = from_binary(&res).unwrap();
+        assert_eq!(item.sold, false);
+        assert_eq!(item.buyer, None);
+    }
+
+    #[test]
+    fn test_refund_buyer_already_delivered() {
+        let mut deps = setup_contract();
+        let info = mock_info("buyer", &coins(1000, "uxion"));
+        execute(deps.as_mut(), mock_env(), info, ExecuteMsg::BuyItem {}).unwrap();
+
+        let info = mock_info("seller", &[]);
+        execute(
+            deps.as_mut(),
+            mock_env(),
+            info.clone(),
+            ExecuteMsg::ConfirmDelivery {},
+        )
+        .unwrap();
+
+        let msg = ExecuteMsg::RefundBuyer {};
+        let res = execute(deps.as_mut(), mock_env(), info, msg);
+        assert!(res.is_err());
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            "Generic error: Item already delivered"
+        );
+    }
+}
